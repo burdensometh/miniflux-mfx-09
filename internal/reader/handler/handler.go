@@ -119,9 +119,9 @@ func CreateFeed(store *storage.Storage, userID int64, feedCreationRequest *model
 	}
 
 	requestBuilder := fetcher.NewRequestBuilder().
-		WithUsernameAndPassword(feedCreationRequest.Username, feedCreationRequest.Password).
+		WithUsernameAndPassword(feedCreationRequest.Username, feedCreationRequest.Password, feedCreationRequest.FeedURL).
 		WithUserAgent(feedCreationRequest.UserAgent, config.Opts.HTTPClientUserAgent()).
-		WithCookie(feedCreationRequest.Cookie).
+		WithCookie(feedCreationRequest.Cookie, feedCreationRequest.FeedURL).
 		WithTimeout(config.Opts.HTTPClientTimeout()).
 		WithProxyRotator(proxyrotator.ProxyRotatorInstance).
 		WithCustomFeedProxyURL(feedCreationRequest.ProxyURL).
@@ -175,6 +175,14 @@ func CreateFeed(store *storage.Storage, userID int64, feedCreationRequest *model
 	subscription.EtagHeader = responseHandler.ETag()
 	subscription.LastModifiedHeader = responseHandler.LastModified()
 	subscription.FeedURL = responseHandler.EffectiveURL()
+	// Adopt the post-redirect URL as the feed URL only when it belongs to
+	// the same website as the submitted URL. A redirect to another website
+	// must not rebind the feed's credentials to the redirect target: keep
+	// polling the URL the credentials were configured for, and let the
+	// per-request credential scoping drop them at the site boundary.
+	if !fetcher.IsSameSiteURL(feedCreationRequest.FeedURL, subscription.FeedURL) {
+		subscription.FeedURL = feedCreationRequest.FeedURL
+	}
 	subscription.ProxyURL = feedCreationRequest.ProxyURL
 	subscription.WithCategoryID(feedCreationRequest.CategoryID)
 	subscription.CheckedNow()
@@ -226,9 +234,9 @@ func RefreshFeed(store *storage.Storage, userID, feedID int64, forceRefresh bool
 	originalFeed.ScheduleNextCheck(weeklyEntryCount, time.Duration(0))
 
 	requestBuilder := fetcher.NewRequestBuilder().
-		WithUsernameAndPassword(originalFeed.Username, originalFeed.Password).
+		WithUsernameAndPassword(originalFeed.Username, originalFeed.Password, originalFeed.FeedURL).
 		WithUserAgent(originalFeed.UserAgent, config.Opts.HTTPClientUserAgent()).
-		WithCookie(originalFeed.Cookie).
+		WithCookie(originalFeed.Cookie, originalFeed.FeedURL).
 		WithTimeout(config.Opts.HTTPClientTimeout()).
 		WithProxyRotator(proxyrotator.ProxyRotatorInstance).
 		WithCustomFeedProxyURL(originalFeed.ProxyURL).

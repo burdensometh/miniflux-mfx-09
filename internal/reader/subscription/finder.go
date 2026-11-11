@@ -65,7 +65,14 @@ func (f *subscriptionFinder) FindSubscriptions(websiteURL, rssBridgeURL string, 
 	// Step 1) Check if the website URL is already a feed.
 	if feedFormat, _ := parser.DetectFeedFormat(f.feedResponseInfo.Content); feedFormat != parser.FormatUnknown {
 		f.feedDownloaded = true
-		return Subscriptions{NewSubscription(responseHandler.EffectiveURL(), responseHandler.EffectiveURL(), feedFormat)}, nil
+		subscriptionURL := responseHandler.EffectiveURL()
+		// A redirect to another website must not rebind the credentials
+		// entered for the website to the redirect target: keep the
+		// submitted URL as the subscription URL in that case.
+		if !fetcher.IsSameSiteURL(websiteURL, subscriptionURL) {
+			subscriptionURL = websiteURL
+		}
+		return Subscriptions{NewSubscription(subscriptionURL, subscriptionURL, feedFormat)}, nil
 	}
 
 	// It's not a feed, so we have to process its HTML.

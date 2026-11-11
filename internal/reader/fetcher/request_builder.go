@@ -48,18 +48,20 @@ const (
 )
 
 type RequestBuilder struct {
-	headers            http.Header
-	cookie             string
-	cookieSiteHost     string
-	clientProxyURL     *url.URL
-	clientTimeout      time.Duration
-	useClientProxy     bool
-	withoutRedirects   bool
-	ignoreTLSErrors    bool
-	disableHTTP2       bool
-	disableCompression bool
-	proxyRotator       *proxyrotator.ProxyRotator
-	feedProxyURL       string
+	headers               http.Header
+	cookie                string
+	cookieSiteHost        string
+	authorization         string
+	authorizationSiteHost string
+	clientProxyURL        *url.URL
+	clientTimeout         time.Duration
+	useClientProxy        bool
+	withoutRedirects      bool
+	ignoreTLSErrors       bool
+	disableHTTP2          bool
+	disableCompression    bool
+	proxyRotator          *proxyrotator.ProxyRotator
+	feedProxyURL          string
 }
 
 func NewRequestBuilder() *RequestBuilder {
@@ -106,17 +108,32 @@ func (r *RequestBuilder) WithUserAgent(userAgent string, defaultUserAgent string
 	return r
 }
 
-// WithCookie sets the Cookie header for requests made by this builder.
-func (r *RequestBuilder) WithCookie(cookie string) *RequestBuilder {
+// WithCookie sets the Cookie header for requests to the website of siteURL,
+// that is its host or any host sharing its registrable domain. A cookie
+// configured for a feed must not be sent to the other websites it links to
+// or redirects to.
+func (r *RequestBuilder) WithCookie(cookie, siteURL string) *RequestBuilder {
 	if cookie != "" {
 		r.cookie = cookie
+		r.cookieSiteHost = ""
+		if parsedSiteURL, err := url.Parse(siteURL); err == nil {
+			r.cookieSiteHost = parsedSiteURL.Hostname()
+		}
 	}
 	return r
 }
 
-func (r *RequestBuilder) WithUsernameAndPassword(username, password string) *RequestBuilder {
+// WithUsernameAndPassword sets the Authorization header for requests to the
+// website of siteURL, that is its host or any host sharing its registrable
+// domain. Basic credentials configured for a feed must not be sent to the
+// other websites it links to or redirects to.
+func (r *RequestBuilder) WithUsernameAndPassword(username, password, siteURL string) *RequestBuilder {
 	if username != "" && password != "" {
-		r.headers.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(username+":"+password)))
+		r.authorization = "Basic " + base64.StdEncoding.EncodeToString([]byte(username+":"+password))
+		r.authorizationSiteHost = ""
+		if parsedSiteURL, err := url.Parse(siteURL); err == nil {
+			r.authorizationSiteHost = parsedSiteURL.Hostname()
+		}
 	}
 	return r
 }
@@ -285,12 +302,25 @@ func (r *RequestBuilder) ExecuteRequest(requestURL string) (*http.Response, erro
 
 	client := &http.Client{
 		Timeout: r.clientTimeout,
-	}
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if r.withoutRedirects {
+				return http.ErrUseLastResponse
+			}
 
-	if r.withoutRedirects {
-		client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse
-		}
+			if len(via) >= 10 {
+				return errors.New("fetcher: stopped after 10 redirects")
+			}
+
+			// The client has already copied the headers of the initial
+			// request onto this one, keeping or dropping the sensitive
+			// headers according to its own subdomain rule. Re-apply the
+			// credential scope so the Cookie and Authorization headers are
+			// present exactly when the redirect target belongs to the
+			// website they were configured for: kept on same-site
+			// redirects, dropped on cross-site ones.
+			r.applyCredentialScope(req)
+			return nil
+		},
 	}
 
 	client.Transport = transport
@@ -301,9 +331,7 @@ func (r *RequestBuilder) ExecuteRequest(requestURL string) (*http.Response, erro
 	}
 
 	req.Header = r.headers.Clone()
-	if r.cookie != "" {
-		req.Header.Set("Cookie", r.cookie)
-	}
+	r.applyCredentialScope(req)
 
 	if r.disableCompression {
 		req.Header.Set("Accept-Encoding", "identity")
@@ -331,6 +359,71 @@ func (r *RequestBuilder) ExecuteRequest(requestURL string) (*http.Response, erro
 	))
 
 	return client.Do(req)
+}
+
+// applyCredentialScope attaches the configured Cookie and Authorization
+// headers to req when, and only when, req targets the website they belong
+// to. It runs on the initial request and on every redirect hop, so the
+// credentials never leave their website while same-site redirects keep
+// carrying them.
+func (r *RequestBuilder) applyCredentialScope(req *http.Request) {
+	if r.cookie != "" {
+		if isSameSite(req.URL.Hostname(), r.cookieSiteHost) {
+			req.Header.Set("Cookie", r.cookie)
+		} else {
+			req.Header.Del("Cookie")
+		}
+	}
+
+	if r.authorization != "" {
+		if isSameSite(req.URL.Hostname(), r.authorizationSiteHost) {
+			req.Header.Set("Authorization", r.authorization)
+		} else {
+			req.Header.Del("Authorization")
+		}
+	}
+}
+
+// IsSameSiteURL reports whether two URL strings belong to the same website,
+// see isSameSite. Unparseable URLs are never same-site.
+func IsSameSiteURL(rawURLA, rawURLB string) bool {
+	parsedURLA, err := url.Parse(rawURLA)
+	if err != nil {
+		return false
+	}
+
+	parsedURLB, err := url.Parse(rawURLB)
+	if err != nil {
+		return false
+	}
+
+	return isSameSite(parsedURLA.Hostname(), parsedURLB.Hostname())
+}
+
+// isSameSite reports whether host and siteHost are the same host, or share the
+// same registrable domain, like "www.example.org" and "feeds.example.org".
+// Hosts under a public suffix, like "alice.github.io" and "bob.github.io", are
+// different websites.
+func isSameSite(host, siteHost string) bool {
+	if host == "" || siteHost == "" {
+		return false
+	}
+
+	if host == siteHost {
+		return true
+	}
+
+	domain, err := registrableDomain(host)
+	if err != nil {
+		return false
+	}
+
+	siteDomain, err := registrableDomain(siteHost)
+	if err != nil {
+		return false
+	}
+
+	return domain == siteDomain
 }
 
 // registrableDomain returns the eTLD+1 of host. The public suffix list only
